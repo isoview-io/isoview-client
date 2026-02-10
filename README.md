@@ -1,11 +1,11 @@
-# isoview
+# isoview-client
 
 Python client for the [ISOview](https://isoview.io) energy forecasting API — demand, wind, solar, LMP, and natural gas forecasts across US ISOs, returned as pandas DataFrames.
 
 ## Installation
 
 ```bash
-pip install isoview
+pip install isoview-client
 ```
 
 Requires Python 3.10+. Installs `requests` and `pandas` as dependencies.
