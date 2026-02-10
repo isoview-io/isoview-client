@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "isoview"
+name = "isoview-client"
 version = "0.1.0"
 description = "Python client for the ISOview energy forecasting API"
 readme = "README.md"
