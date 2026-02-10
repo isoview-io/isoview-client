@@ -31,11 +31,11 @@ client = Client("your-api-key")
 ts = client.get_regional_forecast("pjm", "demand")
 
 # Convert to a pandas DataFrame
-df = ts.df
+df = ts.to_df()
 print(df.head())
 ```
 
-Every forecast method returns a `TimeseriesResponse` with a `.df` property that gives you a ready-to-use DataFrame — DatetimeIndex in local time, MultiIndex columns like `("pjm_total", "forecast")`.
+Every forecast method returns a `TimeseriesResponse`. Call `.to_df()` to get a pandas DataFrame with a UTC DatetimeIndex and MultiIndex columns like `("pjm_total", "forecast")`. Pass `utc=False` for local time instead.
 
 ## Examples
 
@@ -81,7 +81,7 @@ print(plants[0].name, plants[0].capacity_mw, "MW")
 
 # Get a forecast
 ts = client.get_plant_forecast("ercot", "wind", id=str(plants[0].id))
-df = ts.df
+df = ts.to_df()
 ```
 
 ### Counties
@@ -125,11 +125,14 @@ ts.created_at  # datetime — when the forecast was generated
 ts.units       # 'MW'
 ts.timezone    # 'America/New_York'
 
-# The good stuff — a pandas DataFrame
-df = ts.df
+# Convert to a pandas DataFrame (UTC index by default)
+df = ts.to_df()
+
+# Or use local time
+df_local = ts.to_df(utc=False)
 ```
 
-The DataFrame has a `DatetimeIndex` in local time and `MultiIndex` columns (e.g. `("pjm_total", "forecast")`).
+The DataFrame has a `DatetimeIndex` and `MultiIndex` columns (e.g. `("pjm_total", "forecast")`).
 
 ### Metadata
 

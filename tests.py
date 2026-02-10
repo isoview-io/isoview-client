@@ -64,14 +64,30 @@ class TestRegionalForecast:
         ts = client.get_regional_forecast("pjm", "demand", id=region_id)
         assert len(ts.columns) >= 1
 
-    def test_df_property(self, client: Client):
+    def test_to_df_utc(self, client: Client):
         ts = client.get_regional_forecast("pjm", "demand")
-        df = ts.df
+        df = ts.to_df()
         assert isinstance(df, pd.DataFrame)
         assert isinstance(df.index, pd.DatetimeIndex)
         assert df.index.name == "time"
         assert isinstance(df.columns, pd.MultiIndex)
+        assert df.shape == (len(ts.time_utc), len(ts.columns))
+
+    def test_to_df_local(self, client: Client):
+        ts = client.get_regional_forecast("pjm", "demand")
+        df = ts.to_df(utc=False)
+        assert isinstance(df, pd.DataFrame)
+        assert df.index.name == "time"
         assert df.shape == (len(ts.time_local), len(ts.columns))
+        assert str(df.index.tz) == ts.timezone
+
+    def test_repr(self, client: Client):
+        ts = client.get_regional_forecast("pjm", "demand")
+        r = repr(ts)
+        assert "TimeseriesResponse(" in r
+        assert "rows=" in r
+        assert "cols=" in r
+        assert ts.units in r
 
 
 class TestRegionalContinuousForecast:
@@ -130,7 +146,7 @@ class TestRegionalBackcast:
         # No duplicate timestamps at chunk boundaries
         assert len(ts.time_utc) == len(set(ts.time_utc))
         # DataFrame should work correctly with merged data
-        df = ts.df
+        df = ts.to_df()
         assert df.shape[0] == len(ts.time_utc)
 
 

@@ -24,7 +24,7 @@ EnsembleModel = Literal["euro_ens", "euro_ec46", "euro_seas5"]
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(repr=False)
 class TimeseriesResponse:
     """Standardized timeseries data returned by forecast, continuous, ensemble, backcast, and summary endpoints."""
 
@@ -37,13 +37,35 @@ class TimeseriesResponse:
     columns: list[list[str]]
     values: list[list[float | None]]
 
-    @property
-    def df(self) -> pd.DataFrame:
-        """Return the timeseries as a pandas DataFrame with a local-time DatetimeIndex and MultiIndex columns."""
-        # Normalize to UTC first then convert to local tz so mixed offsets
-        # (e.g. across DST boundaries in chunked responses) are handled correctly.
-        index = pd.to_datetime(self.time_local, utc=True).tz_convert(self.timezone)
-        index.name = "time"
+    def __repr__(self) -> str:
+        n_rows = len(self.time_utc)
+        n_cols = len(self.columns)
+        col_labels = ["/".join(c) for c in self.columns[:5]]
+        if n_cols > 5:
+            col_labels.append(f"... +{n_cols - 5} more")
+        start = self.time_utc[0].isoformat() if self.time_utc else "N/A"
+        end = self.time_utc[-1].isoformat() if self.time_utc else "N/A"
+        return (
+            f"TimeseriesResponse(model={self.model!r}, units={self.units!r}, "
+            f"timezone={self.timezone!r}, rows={n_rows}, cols={n_cols}, "
+            f"range={start} → {end}, "
+            f"columns=[{', '.join(col_labels)}])"
+        )
+
+    def to_df(self, utc: bool = True) -> pd.DataFrame:
+        """Convert to a pandas DataFrame.
+
+        Args:
+            utc: If True (default), index uses UTC timestamps. If False, index
+                uses local timestamps in the response's timezone.
+        """
+        if utc:
+            index = pd.DatetimeIndex(self.time_utc, name="time")
+        else:
+            # Normalize to UTC first then convert to local tz so mixed offsets
+            # (e.g. across DST boundaries in chunked responses) are handled correctly.
+            index = pd.to_datetime(self.time_local, utc=True).tz_convert(self.timezone)
+            index.name = "time"
         columns = pd.MultiIndex.from_tuples([tuple(c) for c in self.columns])
         # API returns values as columns × timestamps; transpose to rows × columns
         data = dict(enumerate(self.values))
