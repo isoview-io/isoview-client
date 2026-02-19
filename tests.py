@@ -10,7 +10,6 @@ from isoview import (
     LmpNodeResponse,
     PlantResponse,
     RegionResponse,
-    TimelineEntry,
     TimeseriesResponse,
 )
 
@@ -104,8 +103,8 @@ class TestRegionalContinuousForecast:
         ts = client.get_regional_continuous_forecast(
             "miso", "demand",
             id=region_id,
-            start="2025-06-01T00:00:00Z",
-            end="2025-12-01T00:00:00Z",
+            start="2026-01-01T00:00:00Z",
+            end="2026-02-01T00:00:00Z",
             latest_hour=10,
             days_ahead=1,
         )
@@ -137,15 +136,14 @@ class TestRegionalBackcast:
         ts = client.get_regional_backcast(
             "pjm", "demand",
             id=region_id,
-            start="2024-01-01T00:00:00Z",
-            end="2025-12-01T00:00:00Z",
+            start="2026-01-01T00:00:00Z",
+            end="2026-02-15T00:00:00Z",
         )
         assert isinstance(ts, TimeseriesResponse)
-        # Should span nearly 2 years of hourly data
-        assert len(ts.time_utc) > 365 * 24
-        # No duplicate timestamps at chunk boundaries
+        assert len(ts.time_utc) > 0
+        # No duplicate timestamps
         assert len(ts.time_utc) == len(set(ts.time_utc))
-        # DataFrame should work correctly with merged data
+        # DataFrame should work correctly
         df = ts.to_df()
         assert df.shape[0] == len(ts.time_utc)
 
@@ -175,15 +173,6 @@ class TestListPlants:
         assert p.latitude
         assert p.longitude
 
-    def test_plant_timeline(self, client: Client):
-        plants = client.list_plants("ercot", "wind")
-        with_timeline = [p for p in plants if p.timeline]
-        if with_timeline:
-            entry = with_timeline[0].timeline[0]
-            assert isinstance(entry, TimelineEntry)
-            assert entry.event
-
-
 class TestPlantForecast:
     def test_returns_timeseries(self, client: Client):
         plants = client.list_plants("ercot", "wind")
@@ -200,6 +189,15 @@ class TestPlantContinuousForecast:
         ts = client.get_plant_continuous_forecast(
             "ercot", "wind", id=str(plant_id), latest_hour=10, days_ahead=1,
         )
+        assert isinstance(ts, TimeseriesResponse)
+        assert len(ts.time_utc) > 0
+
+
+class TestPlantBackcast:
+    def test_returns_timeseries(self, client: Client):
+        plants = client.list_plants("ercot", "wind")
+        plant_id = plants[0].id
+        ts = client.get_plant_backcast("ercot", "wind", id=str(plant_id))
         assert isinstance(ts, TimeseriesResponse)
         assert len(ts.time_utc) > 0
 

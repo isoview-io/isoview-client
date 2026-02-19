@@ -82,6 +82,9 @@ print(plants[0].name, plants[0].capacity_mw, "MW")
 # Get a forecast
 ts = client.get_plant_forecast("ercot", "wind", id=str(plants[0].id))
 df = ts.to_df()
+
+# Day-ahead backcast for plant-level model evaluation
+ts = client.get_plant_backcast("ercot", "wind", id=str(plants[0].id))
 ```
 
 ### Counties

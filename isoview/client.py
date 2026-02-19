@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
 
@@ -86,14 +86,6 @@ class RegionResponse:
 
 
 @dataclass
-class TimelineEntry:
-    """A single milestone or significant event in a power plant's operational history."""
-
-    date: datetime
-    event: str
-
-
-@dataclass
 class PlantResponse:
     """Comprehensive metadata for a power generation plant."""
 
@@ -108,7 +100,6 @@ class PlantResponse:
     longitude: float
     status: str
     summary: str | None = None
-    timeline: list[TimelineEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -205,13 +196,6 @@ class Client:
 
     @staticmethod
     def _parse_plant(data: dict) -> PlantResponse:
-        timeline = [
-            TimelineEntry(
-                date=datetime.fromisoformat(e["date"]),
-                event=e["event"],
-            )
-            for e in data.get("timeline", [])
-        ]
         return PlantResponse(
             id=data["id"],
             name=data["name"],
@@ -224,7 +208,6 @@ class Client:
             longitude=data["longitude"],
             status=data["status"],
             summary=data.get("summary"),
-            timeline=timeline,
         )
 
     @staticmethod
@@ -520,6 +503,27 @@ class Client:
             "days_ahead": days_ahead,
         }
         return self._chunked_timeseries(f"/plant/{iso}/{type}/continuous", params, start, end)
+
+    def get_plant_backcast(
+        self,
+        iso: Iso,
+        type: PlantType,
+        *,
+        start: datetime | str | None = None,
+        end: datetime | str | None = None,
+        id: str | None = None,
+    ) -> TimeseriesResponse:
+        """Retrieve a continuous historical series of day-ahead backcasted forecasts for individual plants.
+
+        Args:
+            iso: ISO identifier.
+            type: Plant type — 'wind' or 'solar'.
+            start: Start of the time range (inclusive, ISO 8601).
+            end: End of the time range (inclusive, ISO 8601).
+            id: Specific plant ID, or omit for all plants in the BA.
+        """
+        params = {"id": id}
+        return self._chunked_timeseries(f"/plant/{iso}/{type}/backcast", params, start, end)
 
     # -----------------------------------------------------------------------
     # County endpoints

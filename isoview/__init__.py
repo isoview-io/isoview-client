@@ -3,7 +3,6 @@ from .client import (
     TimeseriesResponse,
     RegionResponse,
     PlantResponse,
-    TimelineEntry,
     CountyResponse,
     GasHubResponse,
     LmpNodeResponse,
