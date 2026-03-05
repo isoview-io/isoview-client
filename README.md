@@ -1,6 +1,6 @@
 # isoview-client
 
-Python client for the [ISOview](https://isoview.io) energy forecasting API — demand, wind, solar, LMP, and natural gas forecasts across US ISOs, returned as pandas DataFrames.
+Python client for the [ISOview](https://isoview.io) energy forecasting API — demand, wind, solar, LMP, and natural gas forecasts across US ISOs, returned as dicts or pandas DataFrames.
 
 ## Installation
 
@@ -20,6 +20,18 @@ from isoview import Client
 client = Client("your-api-key")
 ```
 
+## How It Works
+
+The client dynamically builds methods from the API's OpenAPI spec at init time. This means it automatically stays in sync with the API — no client updates needed when new endpoints are added. The spec is cached locally for 1 hour.
+
+```python
+# See all available methods
+dir(client)
+
+# Get help on any method
+help(client.get_regional_forecast)
+```
+
 ## Quick Start
 
 ```python
@@ -27,15 +39,15 @@ from isoview import Client
 
 client = Client("your-api-key")
 
-# Get the latest PJM demand forecast
-ts = client.get_regional_forecast("pjm", "demand")
+# Get the latest PJM demand forecast as a dict
+data = client.get_regional_forecast("pjm", "demand")
 
-# Convert to a pandas DataFrame
-df = ts.to_df()
+# Or get it directly as a pandas DataFrame
+df = client.get_regional_forecast("pjm", "demand", as_df=True)
 print(df.head())
 ```
 
-Every forecast method returns a `TimeseriesResponse`. Call `.to_df()` to get a pandas DataFrame with a UTC DatetimeIndex and MultiIndex columns like `("pjm_total", "forecast")`. Pass `utc=False` for local time instead.
+Timeseries endpoints accept an `as_df=True` keyword argument to return a pandas DataFrame with a UTC DatetimeIndex and MultiIndex columns like `("pjm_total", "forecast")`. Without it, you get the raw API response as a dict.
 
 ## Examples
 
@@ -46,28 +58,30 @@ Forecasts for geographic regions within an ISO — demand, wind, solar, outages,
 ```python
 # See what regions are available
 regions = client.list_regions("pjm", "demand")
+# Returns a list of dicts: [{"id": "pjm_total", "name": "PJM Total", ...}, ...]
 
-# Latest forecast for a specific region
-ts = client.get_regional_forecast("pjm", "demand", id="pjm_total")
+# Latest forecast as a DataFrame
+df = client.get_regional_forecast("pjm", "demand", id="pjm_total", as_df=True)
 
 # Stitched historical forecast — what did the day-ahead forecast
 # look like at 10am each day?
-ts = client.get_regional_continuous_forecast(
+df = client.get_region_continuous_forecast(
     "miso", "wind",
     start="2025-01-01T00:00:00Z",
     end="2025-06-01T00:00:00Z",
     latest_hour=10,
     days_ahead=1,
+    as_df=True,
 )
 
 # Probabilistic ensemble forecast (multiple scenarios)
-ts = client.get_regional_ensemble_forecast("pjm", "demand", id="pjm_total")
+data = client.get_ensemble_forecast("pjm", "demand", id="pjm_total")
 
 # Day-ahead backcast for model evaluation
-ts = client.get_regional_backcast("pjm", "demand")
+data = client.get_region_day_ahead_backcast("pjm", "demand")
 
 # Everything at once — demand, wind, solar, outages, temp, LMP
-ts = client.get_iso_summary("pjm")
+data = client.get_iso_summary("pjm")
 ```
 
 ### Plants
@@ -77,14 +91,10 @@ Generation forecasts for individual wind and solar facilities.
 ```python
 # Browse plants in ERCOT
 plants = client.list_plants("ercot", "wind")
-print(plants[0].name, plants[0].capacity_mw, "MW")
+print(plants[0]["name"], plants[0]["capacity_mw"], "MW")
 
-# Get a forecast
-ts = client.get_plant_forecast("ercot", "wind", id=str(plants[0].id))
-df = ts.to_df()
-
-# Day-ahead backcast for plant-level model evaluation
-ts = client.get_plant_backcast("ercot", "wind", id=str(plants[0].id))
+# Get a forecast as a DataFrame
+df = client.get_plant_forecast("ercot", "wind", id=str(plants[0]["id"]), as_df=True)
 ```
 
 ### Counties
@@ -93,7 +103,7 @@ County-level electricity demand forecasts, disaggregated from regional data.
 
 ```python
 counties = client.list_counties("isone")
-ts = client.get_county_forecast("isone", id=counties[0].id)
+df = client.get_county_forecast("isone", id=counties[0]["id"], as_df=True)
 ```
 
 ### Gas
@@ -102,7 +112,7 @@ Natural gas price forecasts for major trading hubs.
 
 ```python
 hubs = client.list_gas_hubs()
-ts = client.get_gas_forecast(id=hubs[0].id)
+df = client.get_gas_price_forecast(id=hubs[0]["id"], as_df=True)
 ```
 
 ### LMP
@@ -111,57 +121,63 @@ Locational Marginal Price forecasts for electricity market nodes.
 
 ```python
 nodes = client.list_lmp_nodes("pjm", "dalmp")
-ts = client.get_lmp_forecast("pjm", "dalmp", id=nodes[0].id)
+df = client.get_lmp_forecast("pjm", "dalmp", id=nodes[0]["id"], as_df=True)
 ```
 
 ## Working with Responses
 
-### Timeseries
+### Timeseries (as dict)
 
-All forecast, continuous, ensemble, backcast, and summary endpoints return a `TimeseriesResponse`:
+All forecast, continuous, ensemble, backcast, and summary endpoints return a dict by default:
 
 ```python
-ts = client.get_regional_forecast("pjm", "demand")
+data = client.get_regional_forecast("pjm", "demand")
 
-ts.model       # 'optimized'
-ts.created_at  # datetime — when the forecast was generated
-ts.units       # 'MW'
-ts.timezone    # 'America/New_York'
+data["model"]       # 'optimized'
+data["created_at"]  # datetime — when the forecast was generated
+data["units"]       # 'MW'
+data["timezone"]    # 'America/New_York'
+data["time_utc"]    # list of datetime objects
+data["columns"]     # [["pjm_total", "forecast"], ...]
+data["values"]      # [[1234.5, ...], ...]
+```
 
-# Convert to a pandas DataFrame (UTC index by default)
-df = ts.to_df()
+### Timeseries (as DataFrame)
 
-# Or use local time
-df_local = ts.to_df(utc=False)
+Pass `as_df=True` to any timeseries endpoint:
+
+```python
+df = client.get_regional_forecast("pjm", "demand", as_df=True)
 ```
 
 The DataFrame has a `DatetimeIndex` and `MultiIndex` columns (e.g. `("pjm_total", "forecast")`).
 
 ### Metadata
 
-List endpoints return typed objects you can inspect directly:
+List endpoints return plain dicts:
 
 ```python
 regions = client.list_regions("pjm", "demand")
 for r in regions:
-    print(r.id, r.name, r.timezone)
+    print(r["id"], r["name"], r["timezone"])
 
 plants = client.list_plants("ercot", "solar")
 for p in plants:
-    print(p.name, f"{p.capacity_mw} MW", p.state)
+    print(p["name"], f"{p['capacity_mw']} MW", p["state"])
 ```
 
-## Supported ISOs
+## Automatic Chunking
 
-| Code | Name |
-|------|------|
-| `pjm` | PJM Interconnection |
-| `miso` | Midcontinent ISO |
-| `spp` | Southwest Power Pool |
-| `ercot` | Electric Reliability Council of Texas |
-| `caiso` | California ISO |
-| `nyiso` | New York ISO |
-| `isone` | ISO New England |
+Requests spanning more than 365 days are automatically split into yearly chunks and merged:
+
+```python
+df = client.get_region_day_ahead_backcast(
+    "pjm", "demand",
+    start="2023-01-01T00:00:00Z",
+    end="2025-06-01T00:00:00Z",
+    as_df=True,
+)
+```
 
 ## Error Handling
 
@@ -171,7 +187,7 @@ The client raises `requests.HTTPError` on API errors (401, 403, 422, etc.):
 import requests
 
 try:
-    ts = client.get_regional_forecast("pjm", "demand")
+    data = client.get_regional_forecast("pjm", "demand")
 except requests.HTTPError as e:
     print(e.response.status_code, e.response.text)
 ```

@@ -1,723 +1,286 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+import os
+import re
+import tempfile
+import time
 from datetime import datetime, timedelta
-from typing import Literal
 
 import pandas as pd
 import requests
 
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
-
-Iso = Literal["pjm", "miso", "spp", "ercot", "caiso", "nyiso", "isone"]
-RegionMetric = Literal["demand", "wind", "solar", "outage", "poptemp"]
-PlantMetric = Literal["wind", "solar", "wind_icing", "solar_snow"]
-LmpType = Literal["dalmp", "rtlmp"]
-ForecastModel = Literal["optimized", "iso", "normal"]
-ContinuousModel = Literal["optimized", "iso"]
-EnsembleModel = Literal["euro_ens", "euro_ec46", "euro_seas5"]
-
-# ---------------------------------------------------------------------------
-# Response dataclasses
-# ---------------------------------------------------------------------------
+_CACHE_TTL = 3600  # 1 hour
 
 
-@dataclass(repr=False)
-class TimeseriesResponse:
-    """Standardized timeseries data returned by forecast, continuous, ensemble, backcast, and summary endpoints."""
+def _load_spec(base_url: str, session: requests.Session) -> dict:
+    cache_key = hashlib.md5(base_url.encode()).hexdigest()
+    cache_path = os.path.join(tempfile.gettempdir(), f"isoview_spec_{cache_key}.json")
 
-    model: str | None
-    created_at: datetime | None
-    units: str
-    timezone: str
-    time_utc: list[datetime]
-    time_local: list[datetime]
-    columns: list[list[str]]
-    values: list[list[float | None]]
+    if os.path.exists(cache_path):
+        age = time.time() - os.path.getmtime(cache_path)
+        if age < _CACHE_TTL:
+            with open(cache_path) as f:
+                return json.load(f)
 
-    def __repr__(self) -> str:
-        n_rows = len(self.time_utc)
-        n_cols = len(self.columns)
-        col_labels = ["/".join(c) for c in self.columns[:5]]
-        if n_cols > 5:
-            col_labels.append(f"... +{n_cols - 5} more")
-        start = self.time_utc[0].isoformat() if self.time_utc else "N/A"
-        end = self.time_utc[-1].isoformat() if self.time_utc else "N/A"
-        return (
-            f"TimeseriesResponse(model={self.model!r}, units={self.units!r}, "
-            f"timezone={self.timezone!r}, rows={n_rows}, cols={n_cols}, "
-            f"range={start} → {end}, "
-            f"columns=[{', '.join(col_labels)}])"
-        )
-
-    def to_df(self, utc: bool = True) -> pd.DataFrame:
-        """Convert to a pandas DataFrame.
-
-        Args:
-            utc: If True (default), index uses UTC timestamps. If False, index
-                uses local timestamps in the response's timezone.
-        """
-        if utc:
-            index = pd.DatetimeIndex(self.time_utc, name="time")
-        else:
-            # Normalize to UTC first then convert to local tz so mixed offsets
-            # (e.g. across DST boundaries in chunked responses) are handled correctly.
-            index = pd.to_datetime(self.time_local, utc=True).tz_convert(self.timezone)
-            index.name = "time"
-        columns = pd.MultiIndex.from_tuples([tuple(c) for c in self.columns])
-        # API returns values as columns × timestamps; transpose to rows × columns
-        data = dict(enumerate(self.values))
-        df = pd.DataFrame(data, index=index)
-        df.columns = columns
-        return df
+    resp = session.get(f"{base_url}/openapi.json")
+    resp.raise_for_status()
+    spec = resp.json()
+    with open(cache_path, "w") as f:
+        json.dump(spec, f)
+    return spec
 
 
-@dataclass
-class RegionResponse:
-    """Metadata for a geographic forecast region within a Balancing Authority."""
-
-    id: str
-    name: str
-    region_type: str
-    iso: str
-    timezone: str
-
-
-@dataclass
-class PlantResponse:
-    """Comprehensive metadata for a power generation plant."""
-
-    id: str | int
-    name: str
-    plant_type: str
-    capacity_mw: float
-    iso: str
-    operations_begin_date: str
-    state: str
-    latitude: float
-    longitude: float
-    status: str
-    summary: str | None = None
-
-
-@dataclass
-class CountyResponse:
-    """Metadata and geographic boundary for a US county."""
-
-    id: str
-    name: str
-    state: str
-    geojson: dict
-
-
-@dataclass
-class GasHubResponse:
-    """Metadata for a natural gas trading hub or pricing region."""
-
-    id: str
-    name: str
-    timezone: str
-    point: dict
-
-
-@dataclass
-class LmpNodeResponse:
-    """Metadata for a Locational Marginal Price (LMP) node or hub."""
-
-    id: str
-    name: str
-    iso: str
-    timezone: str
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _to_snake_case(summary: str) -> str:
+    return re.sub(r"\s+", "_", summary.strip().lower())
 
 
 def _dt(value: datetime | str | None) -> str | None:
-    """Convert a datetime or string to an ISO-format string suitable for query params."""
     if isinstance(value, datetime):
         return value.isoformat()
     return value
 
 
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
+def _resolve_ref(schema: dict, schemas: dict) -> dict:
+    ref = schema.get("$ref")
+    if ref:
+        name = ref.split("/")[-1]
+        return schemas.get(name, {})
+    return schema
+
+
+def _resolve_response_schema(operation: dict, schemas: dict) -> dict:
+    resp_200 = operation.get("responses", {}).get("200", {})
+    content = resp_200.get("content", {}).get("application/json", {})
+    return _resolve_ref(content.get("schema", {}), schemas)
+
+
+def _is_timeseries_schema(schema: dict) -> bool:
+    props = schema.get("properties", {})
+    return "time_utc" in props
+
+
+def _parse_datetimes(data, schema: dict, schemas: dict):
+    if isinstance(data, list) and schema.get("type") == "array":
+        item_schema = _resolve_ref(schema.get("items", {}), schemas)
+        return [_parse_datetimes(item, item_schema, schemas) for item in data]
+
+    if isinstance(data, dict):
+        props = schema.get("properties", {})
+        for key, value in data.items():
+            if key not in props:
+                continue
+            prop_schema = _resolve_ref(props[key], schemas)
+            if prop_schema.get("format") == "date-time" and isinstance(value, str):
+                data[key] = datetime.fromisoformat(value)
+            elif prop_schema.get("type") == "array":
+                item_schema = _resolve_ref(prop_schema.get("items", {}), schemas)
+                if item_schema.get("format") == "date-time":
+                    data[key] = [datetime.fromisoformat(v) for v in value if isinstance(v, str)]
+                else:
+                    data[key] = _parse_datetimes(value, prop_schema, schemas)
+            elif prop_schema.get("type") == "object":
+                data[key] = _parse_datetimes(value, prop_schema, schemas)
+    return data
+
+
+def _timeseries_to_df(data: dict, utc: bool = True) -> pd.DataFrame:
+    if utc:
+        index = pd.DatetimeIndex(data["time_utc"], name="time")
+    else:
+        index = pd.to_datetime(data["time_local"], utc=True).tz_convert(data["timezone"])
+        index.name = "time"
+    columns = pd.MultiIndex.from_tuples([tuple(c) for c in data["columns"]])
+    vals = dict(enumerate(data["values"]))
+    df = pd.DataFrame(vals, index=index)
+    df.columns = columns
+    return df
+
+
+def _merge_timeseries_dicts(chunks: list[dict]) -> dict:
+    first = chunks[0]
+    merged = {**first}
+    merged["time_utc"] = list(first["time_utc"])
+    merged["time_local"] = list(first["time_local"])
+    merged["values"] = [list(col) for col in first["values"]]
+
+    for chunk in chunks[1:]:
+        skip = 1 if chunk["time_utc"] and merged["time_utc"] and chunk["time_utc"][0] == merged["time_utc"][-1] else 0
+        merged["time_utc"].extend(chunk["time_utc"][skip:])
+        merged["time_local"].extend(chunk["time_local"][skip:])
+        for i, col in enumerate(chunk["values"]):
+            merged["values"][i].extend(col[skip:])
+    return merged
+
+
+def _build_docstring(operation: dict, path_params: list, query_params: list, is_timeseries: bool) -> str:
+    lines = [operation.get("description", operation.get("summary", ""))]
+    lines.append("")
+
+    if path_params or query_params or is_timeseries:
+        lines.append("Args:")
+        for p in path_params:
+            desc = p.get("schema", {}).get("description", p.get("description", ""))
+            lines.append(f"    {p['name']}: {desc}" if desc else f"    {p['name']}")
+        for p in query_params:
+            desc = p.get("schema", {}).get("description", p.get("description", ""))
+            lines.append(f"    {p['name']}: {desc}" if desc else f"    {p['name']}")
+        if is_timeseries:
+            lines.append("    as_df: If True, return a pandas DataFrame instead of a dict.")
+
+    return "\n".join(lines)
+
+
+_DATETIME_PARAM_NAMES = frozenset({"start", "end", "forecasted_by", "as_of"})
 
 
 class Client:
     """Python client for the ISOview REST API.
+
+    Dynamically builds methods from the OpenAPI spec at ``{base_url}/openapi.json``.
 
     Args:
         api_key: Your ISOview API key.
         base_url: Base URL of the API (default ``https://api.isoview.io/v1``).
     """
 
+    _MAX_RANGE = timedelta(days=365)
+
     def __init__(self, api_key: str, base_url: str = "https://api.isoview.io/v1"):
         self._api_key = api_key
         self._base_url = base_url
         self._session = requests.Session()
         self._session.headers["X-API-Key"] = api_key
+        self._method_names: list[str] = []
 
-    # -- internal helpers ---------------------------------------------------
+        spec = _load_spec(base_url, self._session)
+        self._build_methods(spec)
 
     def _get(self, path: str, params: dict | None = None) -> dict | list:
         resp = self._session.get(f"{self._base_url}{path}", params=params)
         resp.raise_for_status()
         return resp.json()
 
-    @staticmethod
-    def _parse_timeseries(data: dict) -> TimeseriesResponse:
-        created_at_raw = data.get("created_at")
-        return TimeseriesResponse(
-            model=data.get("model"),
-            created_at=datetime.fromisoformat(created_at_raw) if created_at_raw else None,
-            units=data["units"],
-            timezone=data["timezone"],
-            time_utc=[datetime.fromisoformat(t) for t in data["time_utc"]],
-            time_local=[datetime.fromisoformat(t) for t in data["time_local"]],
-            columns=data["columns"],
-            values=data["values"],
-        )
-
-    @staticmethod
-    def _parse_region(data: dict) -> RegionResponse:
-        return RegionResponse(
-            id=data["id"],
-            name=data["name"],
-            region_type=data["region_type"],
-            iso=data["iso"],
-            timezone=data["timezone"],
-        )
-
-    @staticmethod
-    def _parse_plant(data: dict) -> PlantResponse:
-        return PlantResponse(
-            id=data["id"],
-            name=data["name"],
-            plant_type=data["plant_type"],
-            capacity_mw=data["capacity_mw"],
-            iso=data["iso"],
-            operations_begin_date=data["operations_begin_date"],
-            state=data["state"],
-            latitude=data["latitude"],
-            longitude=data["longitude"],
-            status=data["status"],
-            summary=data.get("summary"),
-        )
-
-    @staticmethod
-    def _parse_county(data: dict) -> CountyResponse:
-        return CountyResponse(
-            id=data["id"],
-            name=data["name"],
-            state=data["state"],
-            geojson=data["geojson"],
-        )
-
-    @staticmethod
-    def _parse_gas_hub(data: dict) -> GasHubResponse:
-        return GasHubResponse(
-            id=data["id"],
-            name=data["name"],
-            timezone=data["timezone"],
-            point=data["point"],
-        )
-
-    @staticmethod
-    def _parse_lmp_node(data: dict) -> LmpNodeResponse:
-        return LmpNodeResponse(
-            id=data["id"],
-            name=data["name"],
-            iso=data["iso"],
-            timezone=data["timezone"],
-        )
-
-    _MAX_RANGE = timedelta(days=365)
-
-    def _chunked_timeseries(
-        self,
-        path: str,
-        params: dict,
-        start: datetime | str | None,
-        end: datetime | str | None,
-    ) -> TimeseriesResponse:
-        """Fetch a timeseries, automatically splitting into 1-year chunks if the range exceeds the API limit."""
-
-        def _clean(p: dict) -> dict:
-            return {k: v for k, v in p.items() if v is not None}
-
-        if start is not None and end is not None:
-            start_dt = datetime.fromisoformat(start) if isinstance(start, str) else start
-            end_dt = datetime.fromisoformat(end) if isinstance(end, str) else end
-
-            if (end_dt - start_dt) > self._MAX_RANGE:
-                chunks: list[TimeseriesResponse] = []
-                chunk_start = start_dt
-                while chunk_start < end_dt:
-                    chunk_end = min(chunk_start + self._MAX_RANGE, end_dt)
-                    chunk_params = {**params, "start": chunk_start.isoformat(), "end": chunk_end.isoformat()}
-                    data = self._get(path, _clean(chunk_params))
-                    chunks.append(self._parse_timeseries(data))
-                    chunk_start = chunk_end
-                return self._merge_timeseries(chunks)
-
-        full_params = {**params, "start": _dt(start), "end": _dt(end)}
-        data = self._get(path, _clean(full_params))
-        return self._parse_timeseries(data)
-
-    @staticmethod
-    def _merge_timeseries(chunks: list[TimeseriesResponse]) -> TimeseriesResponse:
-        """Merge multiple TimeseriesResponse chunks into one, deduplicating boundary timestamps."""
-        first = chunks[0]
-        all_time_utc: list[datetime] = list(first.time_utc)
-        all_time_local: list[datetime] = list(first.time_local)
-        all_values: list[list[float | None]] = [list(col) for col in first.values]
-
-        for chunk in chunks[1:]:
-            skip = 1 if chunk.time_utc and all_time_utc and chunk.time_utc[0] == all_time_utc[-1] else 0
-            all_time_utc.extend(chunk.time_utc[skip:])
-            all_time_local.extend(chunk.time_local[skip:])
-            for i, col in enumerate(chunk.values):
-                all_values[i].extend(col[skip:])
-
-        return TimeseriesResponse(
-            model=first.model,
-            created_at=first.created_at,
-            units=first.units,
-            timezone=first.timezone,
-            time_utc=all_time_utc,
-            time_local=all_time_local,
-            columns=first.columns,
-            values=all_values,
-        )
-
-    # -----------------------------------------------------------------------
-    # Region endpoints
-    # -----------------------------------------------------------------------
-
-    def list_regions(self, iso: Iso, metric: RegionMetric) -> list[RegionResponse]:
-        """List all available regions for a forecast metric within an ISO.
-
-        Returns metadata for each region including unique ID, name, region type,
-        ISO, and local timezone.
-        """
-        data = self._get(f"/region/{iso}/{metric}/list")
-        return [self._parse_region(item) for item in data]
-
-    def get_regional_forecast(
-        self,
-        iso: Iso,
-        metric: RegionMetric,
-        *,
-        model: ForecastModel | None = None,
-        id: str | None = None,
-        forecasted_by: datetime | str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve the latest forecast timeseries for one or more regions.
-
-        Args:
-            iso: ISO identifier.
-            metric: Forecast metric type.
-            model: Weather model — 'optimized' (default), 'iso', or 'normal'.
-            id: Specific region ID, or omit for all regions in the BA.
-            forecasted_by: Only return forecasts created at or before this UTC timestamp.
-        """
-        params = {"model": model, "id": id, "forecasted_by": _dt(forecasted_by)}
-        data = self._get(f"/region/{iso}/{metric}/forecast", {k: v for k, v in params.items() if v is not None})
-        return self._parse_timeseries(data)
-
-    def get_regional_continuous_forecast(
-        self,
-        iso: Iso,
-        metric: RegionMetric,
-        *,
-        start: datetime | str | None = None,
-        end: datetime | str | None = None,
-        id: str | None = None,
-        model: ContinuousModel | None = None,
-        latest_hour: int | None = None,
-        days_ahead: int | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve a continuous "stitched" forecast for a region, ISO, and time period.
-
-        Combines forecasts from consecutive model runs into a seamless timeseries.
-        For each day, selects the forecast published at *latest_hour* (local time)
-        with a lead time of *days_ahead* days.
-
-        Args:
-            iso: ISO identifier.
-            metric: Forecast metric type.
-            start: Start of the time range (inclusive, ISO 8601).
-            end: End of the time range (inclusive, ISO 8601).
-            id: Specific region ID, or omit for all regions.
-            model: 'optimized' (default) or 'iso'.
-            latest_hour: Local hour (0–23) for model-run selection.
-            days_ahead: Forecast horizon in days (1–14).
-        """
-        params = {
-            "id": id,
-            "model": model,
-            "latest_hour": latest_hour,
-            "days_ahead": days_ahead,
-        }
-        return self._chunked_timeseries(f"/region/{iso}/{metric}/continuous", params, start, end)
-
-    def get_regional_ensemble_forecast(
-        self,
-        iso: Iso,
-        metric: RegionMetric,
-        *,
-        id: str,
-        model: EnsembleModel | None = None,
-        forecasted_by: datetime | str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve probabilistic ensemble forecasts for a specific region.
-
-        Returns multiple forecast scenarios (members) from probabilistic weather
-        models representing the range of possible outcomes.
-
-        Args:
-            iso: ISO identifier.
-            metric: Forecast metric type.
-            id: Region ID (required for ensemble forecasts).
-            model: Ensemble model — 'euro_ens' (default), 'euro_ec46', or 'euro_seas5'.
-            forecasted_by: Only return forecasts created at or before this UTC timestamp.
-        """
-        params = {"id": id, "model": model, "forecasted_by": _dt(forecasted_by)}
-        data = self._get(f"/region/{iso}/{metric}/ensemble", {k: v for k, v in params.items() if v is not None})
-        return self._parse_timeseries(data)
-
-    def get_regional_backcast(
-        self,
-        iso: Iso,
-        metric: RegionMetric,
-        *,
-        start: datetime | str | None = None,
-        end: datetime | str | None = None,
-        id: str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve a continuous historical series of day-ahead backcasted forecasts.
-
-        Args:
-            iso: ISO identifier.
-            metric: Forecast metric type.
-            start: Start of the time range (inclusive, ISO 8601).
-            end: End of the time range (inclusive, ISO 8601).
-            id: Specific region ID, or omit for all regions.
-        """
-        params = {"id": id}
-        return self._chunked_timeseries(f"/region/{iso}/{metric}/backcast", params, start, end)
-
-    def get_iso_summary(
-        self,
-        iso: Iso,
-        *,
-        as_of: datetime | str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve a comprehensive summary of all forecast metrics for an ISO.
-
-        Returns the latest forecast and actual data for all active regions across
-        demand, wind, solar, outages, population-weighted temperature, and day-ahead LMP.
-
-        Args:
-            iso: ISO identifier.
-            as_of: Retrieve forecasts as they appeared at this UTC timestamp.
-        """
-        params = {"as_of": _dt(as_of)}
-        data = self._get(f"/region/{iso}/summary", {k: v for k, v in params.items() if v is not None})
-        return self._parse_timeseries(data)
-
-    # -----------------------------------------------------------------------
-    # Plant endpoints
-    # -----------------------------------------------------------------------
-
-    def list_plants(self, iso: Iso, metric: PlantMetric) -> list[PlantResponse]:
-        """List all active power generation plants of a specific type within an ISO.
-
-        Returns metadata including capacity, coordinates, operational dates, and timeline.
-        """
-        data = self._get(f"/plant/{iso}/{metric}/list")
-        return [self._parse_plant(item) for item in data]
-
-    def get_plant_forecast(
-        self,
-        iso: Iso,
-        metric: PlantMetric,
-        *,
-        model: ForecastModel | None = None,
-        id: str | None = None,
-        forecasted_by: datetime | str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve generation forecast timeseries for wind or solar plants.
-
-        Forecasts represent theoretical generation potential and do not account for
-        curtailment, transmission constraints, or maintenance outages.
-
-        Args:
-            iso: ISO identifier.
-            metric: Plant metric — 'wind', 'solar', 'wind_icing', or 'solar_snow'.
-            model: Weather model — 'optimized' (default), 'iso', or 'normal'.
-            id: Specific plant ID, or omit for all plants in the ISO.
-            forecasted_by: Only return forecasts created at or before this UTC timestamp.
-        """
-        params = {"model": model, "id": id, "forecasted_by": _dt(forecasted_by)}
-        data = self._get(f"/plant/{iso}/{metric}/forecast", {k: v for k, v in params.items() if v is not None})
-        return self._parse_timeseries(data)
-
-    def get_plant_continuous_forecast(
-        self,
-        iso: Iso,
-        metric: PlantMetric,
-        *,
-        start: datetime | str | None = None,
-        end: datetime | str | None = None,
-        id: str | None = None,
-        model: ContinuousModel | None = None,
-        latest_hour: int | None = None,
-        days_ahead: int | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve a continuous "stitched" generation forecast for wind or solar plants.
-
-        Creates a seamless historical timeseries by combining forecasts from
-        consecutive model runs.
-
-        Args:
-            iso: ISO identifier.
-            metric: Plant metric — 'wind', 'solar', 'wind_icing', or 'solar_snow'.
-            start: Start of the time range (inclusive, ISO 8601).
-            end: End of the time range (inclusive, ISO 8601).
-            id: Specific plant ID, or omit for all plants.
-            model: 'optimized' (default) or 'iso'.
-            latest_hour: Local hour (0–23) for model-run selection.
-            days_ahead: Forecast horizon in days (1–14).
-        """
-        params = {
-            "id": id,
-            "model": model,
-            "latest_hour": latest_hour,
-            "days_ahead": days_ahead,
-        }
-        return self._chunked_timeseries(f"/plant/{iso}/{metric}/continuous", params, start, end)
-
-    def get_plant_backcast(
-        self,
-        iso: Iso,
-        metric: PlantMetric,
-        *,
-        start: datetime | str | None = None,
-        end: datetime | str | None = None,
-        id: str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve a continuous historical series of day-ahead backcasted forecasts for individual plants.
-
-        Args:
-            iso: ISO identifier.
-            metric: Plant metric — 'wind', 'solar', 'wind_icing', or 'solar_snow'.
-            start: Start of the time range (inclusive, ISO 8601).
-            end: End of the time range (inclusive, ISO 8601).
-            id: Specific plant ID, or omit for all plants in the ISO.
-        """
-        params = {"id": id}
-        return self._chunked_timeseries(f"/plant/{iso}/{metric}/backcast", params, start, end)
-
-    # -----------------------------------------------------------------------
-    # County endpoints
-    # -----------------------------------------------------------------------
-
-    def list_counties(self, iso: Iso) -> list[CountyResponse]:
-        """List all US counties within a specific ISO.
-
-        Returns metadata including county name, state, and GeoJSON boundary geometry.
-        Counties can span multiple Balancing Authorities.
-        """
-        data = self._get(f"/county/{iso}/list")
-        return [self._parse_county(item) for item in data]
-
-    def get_county_forecast(
-        self,
-        iso: Iso,
-        *,
-        model: ForecastModel | None = None,
-        id: str | None = None,
-        forecasted_by: datetime | str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve electricity demand forecast timeseries for one or more counties.
-
-        County forecasts are derived by disaggregating regional forecasts using
-        population weighting, historical load patterns, and local weather data.
-
-        Args:
-            iso: ISO identifier.
-            model: Weather model — 'optimized' (default), 'iso', or 'normal'.
-            id: Specific county ID, or omit for all counties in the ISO.
-            forecasted_by: Only return forecasts created at or before this UTC timestamp.
-        """
-        params = {"model": model, "id": id, "forecasted_by": _dt(forecasted_by)}
-        data = self._get(f"/county/{iso}/forecast", {k: v for k, v in params.items() if v is not None})
-        return self._parse_timeseries(data)
-
-    def get_county_continuous_forecast(
-        self,
-        iso: Iso,
-        *,
-        start: datetime | str | None = None,
-        end: datetime | str | None = None,
-        id: str | None = None,
-        model: ContinuousModel | None = None,
-        latest_hour: int | None = None,
-        days_ahead: int | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve a continuous "stitched" demand forecast for one or more counties.
-
-        Args:
-            iso: ISO identifier.
-            start: Start of the time range (inclusive, ISO 8601).
-            end: End of the time range (inclusive, ISO 8601).
-            id: Specific county ID, or omit for all counties.
-            model: 'optimized' (default) or 'iso'.
-            latest_hour: Local hour (0–23) for model-run selection.
-            days_ahead: Forecast horizon in days (1–14).
-        """
-        params = {
-            "id": id,
-            "model": model,
-            "latest_hour": latest_hour,
-            "days_ahead": days_ahead,
-        }
-        return self._chunked_timeseries(f"/county/{iso}/continuous", params, start, end)
-
-    # -----------------------------------------------------------------------
-    # Gas endpoints
-    # -----------------------------------------------------------------------
-
-    def list_gas_hubs(self) -> list[GasHubResponse]:
-        """List all supported natural gas trading hubs and pricing regions.
-
-        Returns metadata including hub identifier, name, geographic coordinates,
-        and local timezone.
-        """
-        data = self._get("/gas/list")
-        return [self._parse_gas_hub(item) for item in data]
-
-    def get_gas_forecast(
-        self,
-        *,
-        model: ForecastModel | None = None,
-        id: str | None = None,
-        forecasted_by: datetime | str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve natural gas price forecasts for trading hubs.
-
-        Returns daily natural gas price predictions.
-
-        Args:
-            model: Weather model — 'optimized' (default), 'iso', or 'normal'.
-            id: Specific hub ID, or omit for all available hubs.
-            forecasted_by: Only return forecasts created at or before this UTC timestamp.
-        """
-        params = {"model": model, "id": id, "forecasted_by": _dt(forecasted_by)}
-        data = self._get("/gas/forecast", {k: v for k, v in params.items() if v is not None})
-        return self._parse_timeseries(data)
-
-    def get_gas_continuous_forecast(
-        self,
-        *,
-        start: datetime | str | None = None,
-        end: datetime | str | None = None,
-        id: str | None = None,
-        model: ContinuousModel | None = None,
-        latest_hour: int | None = None,
-        days_ahead: int | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve a continuous "stitched" natural gas price forecast series.
-
-        Args:
-            start: Start of the time range (inclusive, ISO 8601).
-            end: End of the time range (inclusive, ISO 8601).
-            id: Specific hub ID, or omit for all hubs.
-            model: 'optimized' (default) or 'iso'.
-            latest_hour: Local hour (0–23) for model-run selection.
-            days_ahead: Forecast horizon in days (1–14).
-        """
-        params = {
-            "id": id,
-            "model": model,
-            "latest_hour": latest_hour,
-            "days_ahead": days_ahead,
-        }
-        return self._chunked_timeseries("/gas/continuous", params, start, end)
-
-    # -----------------------------------------------------------------------
-    # LMP endpoints
-    # -----------------------------------------------------------------------
-
-    def list_lmp_nodes(self, iso: Iso, type: LmpType) -> list[LmpNodeResponse]:
-        """List all available LMP nodes for a market type within an ISO.
-
-        Returns metadata including node ID, name, Balancing Authority, and timezone.
-        Currently only Day-Ahead LMP (dalmp) is supported.
-        """
-        data = self._get(f"/lmp/{iso}/{type}/list")
-        return [self._parse_lmp_node(item) for item in data]
-
-    def get_lmp_forecast(
-        self,
-        iso: Iso,
-        type: LmpType,
-        *,
-        model: ForecastModel | None = None,
-        id: str | None = None,
-        forecasted_by: datetime | str | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve LMP forecast timeseries for specific nodes or hubs.
-
-        Returns hourly electricity price forecasts based on demand, generation,
-        and transmission models.
-
-        Args:
-            iso: ISO identifier.
-            type: LMP market type — 'dalmp' or 'rtlmp'.
-            model: Weather model — 'optimized' (default), 'iso', or 'normal'.
-            id: Specific node ID, or omit for all nodes in the BA.
-            forecasted_by: Only return forecasts created at or before this UTC timestamp.
-        """
-        params = {"model": model, "id": id, "forecasted_by": _dt(forecasted_by)}
-        data = self._get(f"/lmp/{iso}/{type}/forecast", {k: v for k, v in params.items() if v is not None})
-        return self._parse_timeseries(data)
-
-    def get_lmp_continuous_forecast(
-        self,
-        iso: Iso,
-        type: LmpType,
-        *,
-        start: datetime | str | None = None,
-        end: datetime | str | None = None,
-        id: str | None = None,
-        model: ContinuousModel | None = None,
-        latest_hour: int | None = None,
-        days_ahead: int | None = None,
-    ) -> TimeseriesResponse:
-        """Retrieve a continuous "stitched" LMP forecast for backtesting trading strategies.
-
-        Args:
-            iso: ISO identifier.
-            type: LMP market type — 'dalmp' or 'rtlmp'.
-            start: Start of the time range (inclusive, ISO 8601).
-            end: End of the time range (inclusive, ISO 8601).
-            id: Specific node ID, or omit for all nodes.
-            model: 'optimized' (default) or 'iso'.
-            latest_hour: Local hour (0–23) for model-run selection.
-            days_ahead: Forecast horizon in days (1–14).
-        """
-        params = {
-            "id": id,
-            "model": model,
-            "latest_hour": latest_hour,
-            "days_ahead": days_ahead,
-        }
-        return self._chunked_timeseries(f"/lmp/{iso}/{type}/continuous", params, start, end)
+    def _build_methods(self, spec: dict) -> None:
+        schemas = spec.get("components", {}).get("schemas", {})
+
+        # First pass: collect all raw names to detect duplicates
+        operations = []
+        name_counts: dict[str, int] = {}
+        for path, path_item in spec["paths"].items():
+            for http_method, operation in path_item.items():
+                if http_method not in ("get", "post", "put", "patch", "delete"):
+                    continue
+                raw_name = _to_snake_case(operation["summary"])
+                name_counts[raw_name] = name_counts.get(raw_name, 0) + 1
+                operations.append((path, http_method, operation, raw_name))
+
+        # Second pass: disambiguate duplicates using the first path segment
+        for path, http_method, operation, raw_name in operations:
+            if name_counts[raw_name] > 1:
+                # Use first path segment as prefix: /region/... -> "region", /plant/... -> "plant"
+                prefix = path.strip("/").split("/")[0]
+                if prefix and prefix not in raw_name:
+                    parts = raw_name.split("_", 1)
+                    name = f"{parts[0]}_{prefix}_{parts[1]}" if len(parts) > 1 else f"{raw_name}_{prefix}"
+                else:
+                    name = raw_name
+            else:
+                name = raw_name
+
+            # Normalize: replace hyphens with underscores for valid Python identifiers
+            name = name.replace("-", "_")
+
+            params = operation.get("parameters", [])
+            path_params = [p for p in params if p["in"] == "path"]
+            query_params = [p for p in params if p["in"] == "query"]
+
+            resp_schema = _resolve_response_schema(operation, schemas)
+            is_timeseries = _is_timeseries_schema(resp_schema)
+            is_list = resp_schema.get("type") == "array"
+            has_chunking = any(p["name"] in ("start", "end") for p in query_params)
+
+            method = self._make_method(
+                path, path_params, query_params,
+                is_timeseries, is_list, has_chunking,
+                resp_schema, schemas,
+            )
+            method.__name__ = name
+            method.__qualname__ = f"Client.{name}"
+            method.__doc__ = _build_docstring(operation, path_params, query_params, is_timeseries)
+            setattr(self, name, method)
+            self._method_names.append(name)
+
+    def _make_method(self, path_template, path_params, query_params,
+                     is_timeseries, is_list, has_chunking, resp_schema, schemas):
+
+        def method(*args, **kwargs):
+            # Map positional args to path params
+            path_values = {}
+            for i, pp in enumerate(path_params):
+                if i < len(args):
+                    path_values[pp["name"]] = args[i]
+                elif pp["name"] in kwargs:
+                    path_values[pp["name"]] = kwargs.pop(pp["name"])
+
+            as_df = kwargs.pop("as_df", False) if is_timeseries else False
+
+            # Build query params
+            qp = {}
+            for p in query_params:
+                val = kwargs.get(p["name"])
+                if val is not None:
+                    if p.get("schema", {}).get("format") == "date-time" or p["name"] in _DATETIME_PARAM_NAMES:
+                        val = _dt(val)
+                    qp[p["name"]] = val
+
+            url_path = path_template.format(**path_values)
+
+            if has_chunking and kwargs.get("start") is not None and kwargs.get("end") is not None:
+                return self._chunked_request(url_path, qp, kwargs["start"], kwargs["end"],
+                                             as_df, resp_schema, schemas)
+
+            data = self._get(url_path, qp if qp else None)
+            data = _parse_datetimes(data, resp_schema, schemas)
+
+            if as_df and is_timeseries:
+                return _timeseries_to_df(data)
+            return data
+
+        return method
+
+    def _chunked_request(self, path, params, start, end, as_df, resp_schema, schemas):
+        start_val = _dt(start)
+        end_val = _dt(end)
+        start_dt = datetime.fromisoformat(start_val) if isinstance(start_val, str) else start_val
+        end_dt = datetime.fromisoformat(end_val) if isinstance(end_val, str) else end_val
+
+        if (end_dt - start_dt) > self._MAX_RANGE:
+            chunks = []
+            chunk_start = start_dt
+            while chunk_start < end_dt:
+                chunk_end = min(chunk_start + self._MAX_RANGE, end_dt)
+                chunk_params = {**params, "start": chunk_start.isoformat(), "end": chunk_end.isoformat()}
+                clean = {k: v for k, v in chunk_params.items() if v is not None}
+                data = self._get(path, clean)
+                data = _parse_datetimes(data, resp_schema, schemas)
+                chunks.append(data)
+                chunk_start = chunk_end
+            merged = _merge_timeseries_dicts(chunks)
+            if as_df:
+                return _timeseries_to_df(merged)
+            return merged
+
+        clean = {k: v for k, v in params.items() if v is not None}
+        data = self._get(path, clean if clean else None)
+        data = _parse_datetimes(data, resp_schema, schemas)
+        if as_df:
+            return _timeseries_to_df(data)
+        return data
+
+    def __dir__(self):
+        return sorted(set(super().__dir__() + self._method_names))
+
+    def __repr__(self):
+        return f"Client(base_url={self._base_url!r}, methods={len(self._method_names)})"
