@@ -37,13 +37,13 @@ class TestListRegions:
         assert isinstance(r, RegionResponse)
         assert r.id
         assert r.name
-        assert r.ba == "pjm"
+        assert r.iso == "pjm"
         assert r.timezone
 
     def test_different_iso_and_metric(self, client: Client):
         regions = client.list_regions("ercot", "wind")
         assert len(regions) > 0
-        assert all(r.ba == "ercot" for r in regions)
+        assert all(r.iso == "ercot" for r in regions)
 
 
 class TestRegionalForecast:
@@ -169,7 +169,7 @@ class TestListPlants:
         assert isinstance(p, PlantResponse)
         assert p.name
         assert p.capacity_mw > 0
-        assert p.ba == "ercot"
+        assert p.iso == "ercot"
         assert p.latitude
         assert p.longitude
 
@@ -290,7 +290,7 @@ class TestListLmpNodes:
         assert isinstance(n, LmpNodeResponse)
         assert n.id
         assert n.name
-        assert n.ba == "pjm"
+        assert n.iso == "pjm"
         assert n.timezone
 
 

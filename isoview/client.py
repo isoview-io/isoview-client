@@ -13,7 +13,7 @@ import requests
 
 Iso = Literal["pjm", "miso", "spp", "ercot", "caiso", "nyiso", "isone"]
 RegionMetric = Literal["demand", "wind", "solar", "outage", "poptemp"]
-PlantType = Literal["wind", "solar"]
+PlantMetric = Literal["wind", "solar", "wind_icing", "solar_snow"]
 LmpType = Literal["dalmp", "rtlmp"]
 ForecastModel = Literal["optimized", "iso", "normal"]
 ContinuousModel = Literal["optimized", "iso"]
@@ -81,7 +81,7 @@ class RegionResponse:
     id: str
     name: str
     region_type: str
-    ba: str
+    iso: str
     timezone: str
 
 
@@ -93,7 +93,7 @@ class PlantResponse:
     name: str
     plant_type: str
     capacity_mw: float
-    ba: str
+    iso: str
     operations_begin_date: str
     state: str
     latitude: float
@@ -128,7 +128,7 @@ class LmpNodeResponse:
 
     id: str
     name: str
-    ba: str
+    iso: str
     timezone: str
 
 
@@ -190,7 +190,7 @@ class Client:
             id=data["id"],
             name=data["name"],
             region_type=data["region_type"],
-            ba=data["ba"],
+            iso=data["iso"],
             timezone=data["timezone"],
         )
 
@@ -201,7 +201,7 @@ class Client:
             name=data["name"],
             plant_type=data["plant_type"],
             capacity_mw=data["capacity_mw"],
-            ba=data["ba"],
+            iso=data["iso"],
             operations_begin_date=data["operations_begin_date"],
             state=data["state"],
             latitude=data["latitude"],
@@ -233,7 +233,7 @@ class Client:
         return LmpNodeResponse(
             id=data["id"],
             name=data["name"],
-            ba=data["ba"],
+            iso=data["iso"],
             timezone=data["timezone"],
         )
 
@@ -436,18 +436,18 @@ class Client:
     # Plant endpoints
     # -----------------------------------------------------------------------
 
-    def list_plants(self, iso: Iso, type: PlantType) -> list[PlantResponse]:
+    def list_plants(self, iso: Iso, metric: PlantMetric) -> list[PlantResponse]:
         """List all active power generation plants of a specific type within an ISO.
 
         Returns metadata including capacity, coordinates, operational dates, and timeline.
         """
-        data = self._get(f"/plant/{iso}/{type}/list")
+        data = self._get(f"/plant/{iso}/{metric}/list")
         return [self._parse_plant(item) for item in data]
 
     def get_plant_forecast(
         self,
         iso: Iso,
-        type: PlantType,
+        metric: PlantMetric,
         *,
         model: ForecastModel | None = None,
         id: str | None = None,
@@ -460,19 +460,19 @@ class Client:
 
         Args:
             iso: ISO identifier.
-            type: Plant type — 'wind' or 'solar'.
+            metric: Plant metric — 'wind', 'solar', 'wind_icing', or 'solar_snow'.
             model: Weather model — 'optimized' (default), 'iso', or 'normal'.
-            id: Specific plant ID, or omit for all plants in the BA.
+            id: Specific plant ID, or omit for all plants in the ISO.
             forecasted_by: Only return forecasts created at or before this UTC timestamp.
         """
         params = {"model": model, "id": id, "forecasted_by": _dt(forecasted_by)}
-        data = self._get(f"/plant/{iso}/{type}/forecast", {k: v for k, v in params.items() if v is not None})
+        data = self._get(f"/plant/{iso}/{metric}/forecast", {k: v for k, v in params.items() if v is not None})
         return self._parse_timeseries(data)
 
     def get_plant_continuous_forecast(
         self,
         iso: Iso,
-        type: PlantType,
+        metric: PlantMetric,
         *,
         start: datetime | str | None = None,
         end: datetime | str | None = None,
@@ -488,7 +488,7 @@ class Client:
 
         Args:
             iso: ISO identifier.
-            type: Plant type — 'wind' or 'solar'.
+            metric: Plant metric — 'wind', 'solar', 'wind_icing', or 'solar_snow'.
             start: Start of the time range (inclusive, ISO 8601).
             end: End of the time range (inclusive, ISO 8601).
             id: Specific plant ID, or omit for all plants.
@@ -502,12 +502,12 @@ class Client:
             "latest_hour": latest_hour,
             "days_ahead": days_ahead,
         }
-        return self._chunked_timeseries(f"/plant/{iso}/{type}/continuous", params, start, end)
+        return self._chunked_timeseries(f"/plant/{iso}/{metric}/continuous", params, start, end)
 
     def get_plant_backcast(
         self,
         iso: Iso,
-        type: PlantType,
+        metric: PlantMetric,
         *,
         start: datetime | str | None = None,
         end: datetime | str | None = None,
@@ -517,13 +517,13 @@ class Client:
 
         Args:
             iso: ISO identifier.
-            type: Plant type — 'wind' or 'solar'.
+            metric: Plant metric — 'wind', 'solar', 'wind_icing', or 'solar_snow'.
             start: Start of the time range (inclusive, ISO 8601).
             end: End of the time range (inclusive, ISO 8601).
-            id: Specific plant ID, or omit for all plants in the BA.
+            id: Specific plant ID, or omit for all plants in the ISO.
         """
         params = {"id": id}
-        return self._chunked_timeseries(f"/plant/{iso}/{type}/backcast", params, start, end)
+        return self._chunked_timeseries(f"/plant/{iso}/{metric}/backcast", params, start, end)
 
     # -----------------------------------------------------------------------
     # County endpoints
