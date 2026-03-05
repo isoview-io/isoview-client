@@ -32,6 +32,13 @@ def _load_spec(base_url: str, session: requests.Session) -> dict:
     return spec
 
 
+def clear_cache() -> None:
+    """Delete all cached OpenAPI spec files, forcing a fresh fetch on next Client init."""
+    import glob as _glob
+    for path in _glob.glob(os.path.join(tempfile.gettempdir(), "isoview_spec_*.json")):
+        os.remove(path)
+
+
 def _to_snake_case(summary: str) -> str:
     return re.sub(r"\s+", "_", summary.strip().lower())
 
@@ -263,10 +270,18 @@ class Client:
                 chunk_end = min(chunk_start + self._MAX_RANGE, end_dt)
                 chunk_params = {**params, "start": chunk_start.isoformat(), "end": chunk_end.isoformat()}
                 clean = {k: v for k, v in chunk_params.items() if v is not None}
-                data = self._get(path, clean)
+                try:
+                    data = self._get(path, clean)
+                except requests.HTTPError as e:
+                    if e.response is not None and e.response.status_code == 422:
+                        chunk_start = chunk_end
+                        continue
+                    raise
                 data = _parse_datetimes(data, resp_schema, schemas)
                 chunks.append(data)
                 chunk_start = chunk_end
+            if not chunks:
+                raise ValueError(f"No data available for the requested time range ({start_dt} to {end_dt})")
             merged = _merge_timeseries_dicts(chunks)
             if as_df:
                 return _timeseries_to_df(merged)
