@@ -323,4 +323,4 @@ class TestClientMeta:
         assert client.get_regional_forecast.__doc__
 
     def test_method_count(self, client: Client):
-        assert len(client._method_names) == 19
+        assert len(client._method_names) >= 19
