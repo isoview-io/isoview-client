@@ -92,6 +92,9 @@ def _parse_datetimes(data, schema: dict, schemas: dict):
     return data
 
 
+_DF_KEYS = frozenset({"time_utc", "time_local", "values", "columns"})
+
+
 def _timeseries_to_df(data: dict, utc: bool = True) -> pd.DataFrame:
     if utc:
         index = pd.DatetimeIndex(data["time_utc"], name="time")
@@ -102,6 +105,7 @@ def _timeseries_to_df(data: dict, utc: bool = True) -> pd.DataFrame:
     vals = dict(enumerate(data["values"]))
     df = pd.DataFrame(vals, index=index)
     df.columns = columns
+    df.attrs = {k: v for k, v in data.items() if k not in _DF_KEYS}
     return df
 
 
