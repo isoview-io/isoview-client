@@ -139,6 +139,7 @@ def _build_docstring(operation: dict, path_params: list, query_params: list, is_
             lines.append(f"    {p['name']}: {desc}" if desc else f"    {p['name']}")
         if is_timeseries:
             lines.append("    as_df: If True, return a pandas DataFrame instead of a dict.")
+            lines.append("    utc: If True (default), use time_utc for the DataFrame index; if False, use time_local.")
 
     return "\n".join(lines)
 
@@ -236,6 +237,7 @@ class Client:
                     path_values[pp["name"]] = kwargs.pop(pp["name"])
 
             as_df = kwargs.pop("as_df", False) if is_timeseries else False
+            utc = kwargs.pop("utc", True) if is_timeseries else True
 
             # Build query params
             qp = {}
@@ -250,18 +252,18 @@ class Client:
 
             if has_chunking and kwargs.get("start") is not None and kwargs.get("end") is not None:
                 return self._chunked_request(url_path, qp, kwargs["start"], kwargs["end"],
-                                             as_df, resp_schema, schemas)
+                                             as_df, utc, resp_schema, schemas)
 
             data = self._get(url_path, qp if qp else None)
             data = _parse_datetimes(data, resp_schema, schemas)
 
             if as_df and is_timeseries:
-                return _timeseries_to_df(data)
+                return _timeseries_to_df(data, utc=utc)
             return data
 
         return method
 
-    def _chunked_request(self, path, params, start, end, as_df, resp_schema, schemas):
+    def _chunked_request(self, path, params, start, end, as_df, utc, resp_schema, schemas):
         start_val = _dt(start)
         end_val = _dt(end)
         start_dt = datetime.fromisoformat(start_val) if isinstance(start_val, str) else start_val
@@ -288,14 +290,14 @@ class Client:
                 raise ValueError(f"No data available for the requested time range ({start_dt} to {end_dt})")
             merged = _merge_timeseries_dicts(chunks)
             if as_df:
-                return _timeseries_to_df(merged)
+                return _timeseries_to_df(merged, utc=utc)
             return merged
 
         clean = {k: v for k, v in params.items() if v is not None}
         data = self._get(path, clean if clean else None)
         data = _parse_datetimes(data, resp_schema, schemas)
         if as_df:
-            return _timeseries_to_df(data)
+            return _timeseries_to_df(data, utc=utc)
         return data
 
     def __dir__(self):
